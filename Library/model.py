@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-model.py — Entrenamiento de modelos para TFM (clasificación de alta actividad) con rutas relativas,
-etiquetado por fracción de IC50, prevención de suspensión en Windows, guardado reproducible,
-mensajes de progreso, vista de 'activo' y parada temprana (early stopping).
-
-Novedades vs versión anterior:
-- Muestra distribución y ejemplo de la columna 'activo' (0/1) tras el etiquetado.
-- Muestra head de ENTRENAMIENTO incluyendo 'activo' (no solo features).
-- Nuevo flag: --retrain para forzar entrenamiento aunque exista checkpoint.
-- Progreso de entrenamiento:
-    * RF: incremental con warm_start; imprime AUC/F1 de train y val por bloque; early stopping por paciencia.
-    * XGB: early_stopping_rounds y verbose opcional; imprime mejor iteración.
-- Guarda SIEMPRE el mejor modelo según validación.
+model.py — Entrenamiento de modelos para TFM (clasificación de alta actividad) con:
+- Etiquetado por fracción IC50 y **reporte del corte en nM** (especialmente para 50/50).
+- **K-Fold Cross-Validation** estratificado (por defecto K=5, activado para 500–5000 filas).
+- Prevención de suspensión en Windows, guardado reproducible, progreso y early stopping.
+- Curvas **ROC/PR** y matriz de confusión para val/test; ROC por fold en CV.
 """
 
 import os, sys, json, math, ctypes, hashlib, datetime, warnings, copy
@@ -32,14 +25,14 @@ from sklearn.metrics import (
     roc_auc_score, average_precision_score, f1_score, precision_score, recall_score,
     confusion_matrix, RocCurveDisplay, PrecisionRecallDisplay
 )
-from sklearn.model_selection import StratifiedShuffleSplit, ParameterSampler
+from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, ParameterSampler
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils import check_random_state
 
-# Silenciar FutureWarnings ruidosos (p.ej., SHAP)
+# Silenciar FutureWarnings ruidosos
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Import opcional de XGBoost y SHAP
@@ -80,7 +73,6 @@ META_FORBIDDEN = {
     "PAINS_flag","PAINS_terms","Chelator_flag","Chelator_terms",
     "Lipinski_violations","Veber_violations",
 }
-
 
 # ======================
 # Utilidades
@@ -136,13 +128,16 @@ def pick_id_column(df: pd.DataFrame) -> str:
     return "__index__"
 
 # ======================
-# Etiquetado por fracción
+# Etiquetado por fracción (devuelve y, corte_nM)
 # ======================
-def build_label_by_fraction(values: pd.Series, fraction: float, seed: int = SEED) -> pd.Series:
+def build_label_by_fraction(values: pd.Series, fraction: float, seed: int = SEED) -> Tuple[pd.Series, float]:
     """
-    Marca como 1 (activo) el fraction% de filas con menor IC50 (Standard Value).
+    Marca como 1 el fraction% de filas con menor IC50 (Standard Value).
     Si hay empates en el valor de corte, selecciona aleatoriamente (con semilla) dentro de los empatados
     hasta cumplir exactamente el porcentaje deseado.
+
+    Devuelve:
+      y (Series 0/1) y el **corte en nM** (el IC50 máximo dentro del grupo etiquetado como 1).
     """
     vals = pd.to_numeric(values, errors="coerce")
     valid = vals.notna()
@@ -158,16 +153,16 @@ def build_label_by_fraction(values: pd.Series, fraction: float, seed: int = SEED
     k = int(math.floor(fraction * len(vals_sorted)))
     k = max(1, min(k, len(vals_sorted)))  # al menos 1 y no más que el total
 
-    # Valor de corte
-    cut_val = vals_sorted[k-1]
+    # Valor de corte nominal (k-ésimo)
+    cut_val_nominal = vals_sorted[k-1]
 
     # Todo lo menor que el corte entra seguro
-    mask_lt = vals_sorted < cut_val
+    mask_lt = vals_sorted < cut_val_nominal
     idx_lt = idx_sorted[mask_lt]
     count_lt = len(idx_lt)
 
     # Empatados al corte
-    mask_eq = vals_sorted == cut_val
+    mask_eq = vals_sorted == cut_val_nominal
     idx_eq = idx_sorted[mask_eq]
 
     rng = check_random_state(seed)
@@ -184,7 +179,10 @@ def build_label_by_fraction(values: pd.Series, fraction: float, seed: int = SEED
 
     y = pd.Series(0, index=range(len(values)), dtype=int)
     y.loc[list(chosen)] = 1
-    return y
+
+    # Corte "real" usado: **máximo IC50** dentro de los seleccionados como 1
+    corte_nm = float(np.nanmax(vals.loc[y.astype(bool)])) if y.any() else float(cut_val_nominal)
+    return y, corte_nm
 
 # ======================
 # Splits estratificados
@@ -213,9 +211,7 @@ def stratified_train_val_test(X: pd.DataFrame, y: pd.Series, train_ratio: float,
 # Modelos y preprocesado
 # ======================
 def build_preprocessor(numeric_cols: List[str]) -> ColumnTransformer:
-    num_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median"))
-    ])
+    num_pipe = Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))])
     preproc = ColumnTransformer(
         transformers=[("num", num_pipe, numeric_cols)],
         remainder="drop",
@@ -252,13 +248,13 @@ class XGBConfig:
 def build_model(cfg: Any):
     if getattr(cfg, "algo", "rf") == "rf":
         model = RandomForestClassifier(
-            n_estimators=cfg.step,            # se ajusta incrementalmente
+            n_estimators=cfg.step,            # ajuste incremental
             max_depth=cfg.max_depth,
             min_samples_leaf=cfg.min_samples_leaf,
             class_weight=cfg.class_weight,
             random_state=cfg.random_state,
             n_jobs=cfg.n_jobs,
-            warm_start=True,                  # permite añadir más árboles
+            warm_start=True,
         )
         return model
     elif getattr(cfg, "algo", "") == "xgb":
@@ -284,12 +280,7 @@ def build_model(cfg: Any):
 
 def fit_rf_with_early_stopping(preproc: ColumnTransformer, cfg: RFConfig,
                                X_train, y_train, X_val, y_val):
-    """
-    Entrena RF incrementalmente, evaluando tras cada bloque 'step'.
-    Parada cuando no mejora 'patience' iteraciones la AUC de validación.
-    Devuelve el mejor modelo y el preprocesador.
-    """
-    # Ajustar preprocesador una sola vez
+    """Entrena RF incrementalmente con early stopping en AUC de validación."""
     X_tr = preproc.fit_transform(X_train)
     X_v  = preproc.transform(X_val)
 
@@ -303,12 +294,10 @@ def fit_rf_with_early_stopping(preproc: ColumnTransformer, cfg: RFConfig,
     print(f"[INFO] Comienza entrenamiento RF con early stopping | step={cfg.step}, max_trees={cfg.n_estimators}, patience={cfg.patience}")
 
     while total_trees < cfg.n_estimators:
-        # Aumentar nº de árboles hasta total_trees+step
         model.n_estimators = min(total_trees + cfg.step, cfg.n_estimators)
         model.fit(X_tr, y_train)
 
         total_trees = model.n_estimators
-        # Evaluar
         prob_tr = model.predict_proba(X_tr)[:,1]
         prob_v  = model.predict_proba(X_v)[:,1]
         auc_tr  = roc_auc_score(y_train, prob_tr)
@@ -318,10 +307,9 @@ def fit_rf_with_early_stopping(preproc: ColumnTransformer, cfg: RFConfig,
 
         print(f"[PROGRESO] trees={total_trees:4d} | AUC train={auc_tr:.4f} val={auc_v:.4f} | F1 train={f1_tr:.4f} val={f1_v:.4f}")
 
-        # Actualizar mejor
         if auc_v > best_auc + 1e-6:
             best_auc = auc_v
-            best_model = copy.deepcopy(model)  # snapshot
+            best_model = copy.deepcopy(model)
             best_iter = total_trees
             no_improve = 0
         else:
@@ -335,7 +323,6 @@ def fit_rf_with_early_stopping(preproc: ColumnTransformer, cfg: RFConfig,
         best_iter = total_trees
         print(f"[INFO] No hubo mejora intermedia; uso el último modelo con {best_iter} árboles.")
 
-    # Reemplazar n_estimators por best_iter para coherencia
     best_model.n_estimators = best_iter
     return best_model, preproc
 
@@ -442,7 +429,7 @@ def try_save_shap(model, preproc, X_sample: pd.DataFrame, out_dir: Path, prefix:
 # ======================
 def save_all(model_name: str, model, preproc, config: Dict[str, Any], feature_names: List[str],
              metrics_val: Dict[str, Any], metrics_test: Dict[str, Any],
-             splits_info: Dict[str, Any], data_hash: str, model_dir: Path):
+             splits_info: Dict[str, Any], data_hash: str, model_dir: Path, cv_summary: Optional[Dict[str, Any]] = None):
     ensure_dir(model_dir)
     ckpt = model_dir / "checkpoints"
     ensure_dir(ckpt)
@@ -463,7 +450,7 @@ def save_all(model_name: str, model, preproc, config: Dict[str, Any], feature_na
     plot_and_save_curves(model, preproc, splits_info["X_test"], splits_info["y_test"], plots, "test")
     plot_confusion(metrics_test["confusion_matrix"], plots, "test")
 
-    # SHAP (opcional, si está instalado) — usar una muestra para no saturar
+    # SHAP (opcional) — muestra para no saturar
     _ = try_save_shap(model, preproc, splits_info["X_val"].sample(min(500, len(splits_info["X_val"])), random_state=SEED), plots, "val")
 
     # Guardar info
@@ -473,6 +460,10 @@ def save_all(model_name: str, model, preproc, config: Dict[str, Any], feature_na
     info_lines.append(f"data_hash: {data_hash}")
     info_lines.append(f"n_features: {len(feature_names)}")
     info_lines.append(f"config: {json.dumps(config, ensure_ascii=False)}")
+    if cv_summary is not None:
+        info_lines.append("== CV (Stratified K-Fold) ==")
+        for k, v in cv_summary.items():
+            info_lines.append(f"{k}: {v}")
     info_lines.append("== metrics_val ==")
     for k,v in metrics_val.items():
         if k in ("y_prob","y_pred"): continue
@@ -497,94 +488,89 @@ def save_all(model_name: str, model, preproc, config: Dict[str, Any], feature_na
     })
     df_splits.to_csv(splits_csv, index=False)
 
-def load_checkpoint(model_name: str) -> Tuple[Any, Any, Dict[str, Any]]:
-    model_dir = MODELS_DIR / model_name
-    ckpt = model_dir / "checkpoints"
-    model = joblib.load(ckpt / "model.pkl")
-    preproc = joblib.load(ckpt / "preproc.pkl")
-    cfg = {}
-    try:
-        with open(model_dir / "config.json", "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except Exception:
-        pass
-    return model, preproc, cfg
-
-def exists_checkpoint(model_name: str) -> bool:
-    ckpt = MODELS_DIR / model_name / "checkpoints"
-    return (ckpt / "model.pkl").exists() and (ckpt / "preproc.pkl").exists()
-
-def has_config(model_name: str) -> bool:
-    return (MODELS_DIR / model_name / "config.json").exists()
-
 # ======================
-# Búsqueda de HP (test)
+# Cross-Validation
 # ======================
-def hyperparam_search(X_train, y_train, X_val, y_val, algo: str, seed: int = SEED):
-    rng = check_random_state(seed)
-    leaderboard = []
+def run_cv_evaluation(X: pd.DataFrame, y: pd.Series, numeric_cols: List[str],
+                      algo: str, cfg_any, k: int, plots_dir: Path) -> Dict[str, Any]:
+    """Ejecuta Stratified K-Fold CV (ROC/F1) usando un modelo más ligero para rapidez."""
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=SEED)
+    aucs, f1s, gaps = [], [], []
 
-    if algo == "rf":
-        space = {
-            "n_estimators": [400, 800, 1200, 1600],
-            "max_depth": [None, 8, 12, 16, 24],
-            "min_samples_leaf": [1, 2, 4],
-        }
-        n_iter = 12
-        configs = list(ParameterSampler(space, n_iter=n_iter, random_state=rng))
-        for cfg in configs:
-            cfg_obj = RFConfig(**{"algo":"rf", **cfg})
-            preproc = build_preprocessor([c for c in X_train.columns])
-            # Entrenamiento rápido sin incremental (para test)
+    fold = 0
+    for tr_idx, va_idx in skf.split(X, y):
+        fold += 1
+        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+        pre = build_preprocessor(numeric_cols)
+
+        # Modelo ligero para CV
+        if algo == "rf":
+            cfg = copy.deepcopy(cfg_any)
+            # usar un nº moderado de árboles para CV
+            trees_cv = min(800, getattr(cfg, "n_estimators", 800))
             model = RandomForestClassifier(
-                n_estimators=cfg_obj.n_estimators,
-                max_depth=cfg_obj.max_depth,
-                min_samples_leaf=cfg_obj.min_samples_leaf,
-                class_weight=cfg_obj.class_weight,
-                random_state=cfg_obj.random_state,
-                n_jobs=cfg_obj.n_jobs,
+                n_estimators=trees_cv,
+                max_depth=cfg.max_depth,
+                min_samples_leaf=cfg.min_samples_leaf,
+                class_weight=cfg.class_weight,
+                random_state=SEED,
+                n_jobs=-1,
             )
-            X_tr = preproc.fit_transform(X_train); X_v = preproc.transform(X_val)
-            model.fit(X_tr, y_train)
-            prob_v = model.predict_proba(X_v)[:,1]; pred_v = (prob_v>=0.5).astype(int)
-            auc = roc_auc_score(y_val, prob_v); f1 = f1_score(y_val, pred_v)
-            leaderboard.append((auc, f1, cfg_obj, {"roc_auc":auc, "f1":f1}))
-        leaderboard.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return leaderboard[0], leaderboard
-
-    elif algo == "xgb":
-        if not _HAVE_XGB:
-            raise RuntimeError("XGBoost no está instalado. Instálalo con: pip install xgboost")
-        space = {
-            "n_estimators": [300, 600, 900, 1200],
-            "max_depth": [4, 6, 8],
-            "learning_rate": [0.05, 0.1, 0.2],
-            "subsample": [0.8, 1.0],
-            "colsample_bytree": [0.8, 1.0],
-            "reg_lambda": [0.5, 1.0, 2.0],
-        }
-        n_iter = 18
-        configs = list(ParameterSampler(space, n_iter=n_iter, random_state=rng))
-        for cfg in configs:
-            cfg_obj = XGBConfig(**{"algo":"xgb", **cfg})
-            preproc = build_preprocessor([c for c in X_train.columns])
-            X_tr = preproc.fit_transform(X_train); X_v = preproc.transform(X_val)
+        else:
+            if not _HAVE_XGB:
+                raise RuntimeError("XGBoost no está instalado. pip install xgboost")
+            cfg = copy.deepcopy(cfg_any)
+            est_cv = min(800, getattr(cfg, "n_estimators", 800))
             model = xgb.XGBClassifier(
-                n_estimators=cfg_obj.n_estimators, max_depth=cfg_obj.max_depth,
-                learning_rate=cfg_obj.learning_rate, subsample=cfg_obj.subsample,
-                colsample_bytree=cfg_obj.colsample_bytree, reg_lambda=cfg_obj.reg_lambda,
-                random_state=cfg_obj.random_state, n_jobs=cfg_obj.n_jobs,
-                tree_method="hist", eval_metric="auc"
+                n_estimators=est_cv,
+                max_depth=cfg.max_depth,
+                learning_rate=cfg.learning_rate,
+                subsample=cfg.subsample,
+                colsample_bytree=cfg.colsample_bytree,
+                reg_lambda=cfg.reg_lambda,
+                random_state=SEED,
+                n_jobs=-1,
+                tree_method="hist",
+                eval_metric="auc",
+                verbosity=0,
             )
-            model.fit(X_tr, y_train, eval_set=[(X_v, y_val)], verbose=False)
-            prob_v = model.predict_proba(X_v)[:,1]; pred_v = (prob_v>=0.5).astype(int)
-            auc = roc_auc_score(y_val, prob_v); f1 = f1_score(y_val, pred_v)
-            leaderboard.append((auc, f1, cfg_obj, {"roc_auc":auc, "f1":f1}))
-        leaderboard.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return leaderboard[0], leaderboard
 
-    else:
-        raise ValueError("Algoritmo no soportado en test")
+        X_trp = pre.fit_transform(X_tr)
+        X_vap = pre.transform(X_va)
+        model.fit(X_trp, y_tr)
+
+        # Métricas train/val para detectar overfitting
+        prob_tr = model.predict_proba(X_trp)[:,1] if hasattr(model, "predict_proba") else model.predict(X_trp).astype(float)
+        prob_va = model.predict_proba(X_vap)[:,1] if hasattr(model, "predict_proba") else model.predict(X_vap).astype(float)
+        pred_va = (prob_va >= 0.5).astype(int)
+
+        auc_tr = roc_auc_score(y_tr, prob_tr)
+        auc_va = roc_auc_score(y_va, prob_va)
+        f1_va  = f1_score(y_va, pred_va)
+
+        aucs.append(auc_va)
+        f1s.append(f1_va)
+        gaps.append(auc_tr - auc_va)
+
+        # ROC por fold
+        RocCurveDisplay.from_predictions(y_va, prob_va)
+        plt.title(f"ROC - CV fold {fold}/{k}")
+        plt.tight_layout()
+        plt.savefig(figure_path(plots_dir, f"cv_fold{fold}_roc.png")); plt.close()
+
+        print(f"[CV] fold {fold}/{k} | AUC train={auc_tr:.4f} val={auc_va:.4f} | gap={auc_tr-auc_va:+.4f} | F1 val={f1_va:.4f}")
+
+    summary = {
+        "cv_k": k,
+        "cv_auc_mean": float(np.mean(aucs)),
+        "cv_auc_std":  float(np.std(aucs)),
+        "cv_f1_mean":  float(np.mean(f1s)),
+        "cv_f1_std":   float(np.std(f1s)),
+        "cv_gap_auc_mean": float(np.mean(gaps)),
+    }
+    print(f"[CV] Resumen: AUC {summary['cv_auc_mean']:.4f} ± {summary['cv_auc_std']:.4f} | F1 {summary['cv_f1_mean']:.4f} ± {summary['cv_f1_std']:.4f} | gap AUC (train-val) medio {summary['cv_gap_auc_mean']:+.4f}")
+    return summary
 
 # ======================
 # CLI
@@ -598,6 +584,10 @@ def parse_args():
     p.add_argument("--val", type=float, default=DEFAULT_VAL, help="Proporción de validación (por defecto 0.15).")
     p.add_argument("--model", type=str, default="base", help="Modo: base|new|test|<nombre_modelo>")
     p.add_argument("--retrain", action="store_true", help="Forzar entrenamiento aunque exista checkpoint.")
+
+    # CV
+    p.add_argument("--cv_k", type=int, default=5, help="K para Stratified K-Fold CV (defecto 5).")
+    p.add_argument("--no_cv", action="store_true", help="Desactiva la evaluación de K-Fold CV.")
 
     # Parámetros para --model new
     p.add_argument("--algo", type=str, choices=["rf","xgb"], default="rf", help="Algoritmo (solo en --model new).")
@@ -671,16 +661,17 @@ def main():
     df["Standard Value"] = pd.to_numeric(df["Standard Value"], errors="coerce")
     df = df.dropna(subset=["Standard Value"]).reset_index(drop=True)
 
-    # Etiquetado por fracción
+    # Etiquetado por fracción + reporte de corte en nM
     frac = float(args.ic50) if args.ic50 is not None else DEFAULT_IC50_FRAC
     if not (0.0 < frac <= 1.0):
         raise ValueError("--ic50 debe estar en (0,1].")
-    y = build_label_by_fraction(df["Standard Value"], fraction=frac, seed=SEED)
+    y, corte_nm = build_label_by_fraction(df["Standard Value"], fraction=frac, seed=SEED)
     df["activo"] = y.astype(int)
 
     # Mostrar distribución y ejemplo de 'activo'
     vc = df["activo"].value_counts().sort_index()
     print(f"[INFO] Distribución de 'activo' (0/1): {dict(vc)}  (ic50={frac})")
+    print(f"[INFO] Umbral IC50 usado (nM): {corte_nm:.2f}")
     sample_cols = [c for c in ["Molecule ChEMBL ID","canonical_smiles","Smiles","Standard Value","activo"] if c in df.columns]
     print("[INFO] Vista de ejemplo con 'activo':")
     print(df[sample_cols].head(10))
@@ -729,7 +720,7 @@ def main():
         "test_ids":  test_ids,
     }
 
-    # Selección de modo
+    # Selección de modo y nombre de modelo
     model_arg = args.model or "base"
     if model_arg in MODE_CHOICES:
         mode = model_arg
@@ -738,18 +729,57 @@ def main():
         mode = "named"
         model_name = model_arg
 
+    # Directorios del modelo (para guardar CV/plots tempranos)
+    model_dir = MODELS_DIR / model_name
+    plots_dir = model_dir / "plots"
+    ensure_dir(plots_dir)
+
+    # ---------- CV (activado por defecto para n in [500, 5000]) ----------
+    do_cv = not args.no_cv and (500 <= len(df) <= 5000)
+    cv_summary = None
+    if do_cv:
+        print(f"[INFO] Ejecutando Stratified K-Fold CV (k={args.cv_k}) para estimar generalización y posibles overfittings...")
+        # Determinar algoritmo y cfg para CV
+        if mode == "base":
+            algo = "rf"
+            cfg_cv = make_cfg_obj_from_args(args, "rf")
+        elif mode == "new":
+            algo = args.algo.lower()
+            cfg_cv = make_cfg_obj_from_args(args, algo)
+        elif mode == "test":
+            algo = "rf"  # por simplicidad, CV con RF
+            cfg_cv = make_cfg_obj_from_args(args, "rf")
+        else:  # named
+            cfg_loaded = {}
+            if (model_dir / "config.json").exists():
+                with open(model_dir / "config.json", "r", encoding="utf-8") as f:
+                    cfg_loaded = json.load(f)
+            algo = (cfg_loaded.get("algo") or "rf").lower()
+            if algo == "rf":
+                rf_defaults = asdict(RFConfig())
+                rf_cfg = rf_defaults | cfg_loaded.get("rf", {})
+                class C: pass
+                cfg_cv = RFConfig(**rf_cfg)
+            else:
+                if not _HAVE_XGB:
+                    raise RuntimeError("Config indica XGB pero no está instalado (pip install xgboost).")
+                xgb_defaults = asdict(XGBConfig())
+                xgb_cfg = xgb_defaults | cfg_loaded.get("xgb", {})
+                cfg_cv = XGBConfig(**xgb_cfg)
+
+        cv_summary = run_cv_evaluation(X, y, numeric_cols, algo, cfg_cv, int(args.cv_k), plots_dir)
+    else:
+        print("[INFO] CV desactivado (usar --cv_k para forzar o el dataset está fuera del rango 500–5000).")
+
     prevent_sleep_start()
     try:
         data_hash = hash_file(data_path)
 
         if mode == "base":
-            model_dir = MODELS_DIR / model_name
-            ensure_dir(model_dir)
-            if exists_checkpoint(model_name) and not args.retrain:
+            if (model_dir / "checkpoints" / "model.pkl").exists() and not args.retrain:
                 print("[INFO] Cargando checkpoint existente (base). Usa --retrain para forzar nuevo entrenamiento.")
                 model, preproc, loaded_cfg = load_checkpoint(model_name)
             else:
-                # Entrenamiento base RF con early stopping
                 cfg_obj = make_cfg_obj_from_args(args, "rf")
                 preproc = build_preprocessor(numeric_cols)
                 print(f"[INFO] Iniciando entrenamiento RF base con parámetros: {asdict(cfg_obj)}")
@@ -759,7 +789,7 @@ def main():
                 metrics_val  = evaluate_all(model, preproc, splits_info["X_val"],  splits_info["y_val"])
                 metrics_test = evaluate_all(model, preproc, splits_info["X_test"], splits_info["y_test"])
                 config_dict = {"algo": "rf", "rf": asdict(cfg_obj)}
-                save_all(model_name, model, preproc, config_dict, numeric_cols, metrics_val, metrics_test, splits_info, data_hash, model_dir)
+                save_all(model_name, model, preproc, config_dict, numeric_cols, metrics_val, metrics_test, splits_info, data_hash, model_dir, cv_summary)
                 print("[OK] Modelo base entrenado y guardado.")
                 return 0
 
@@ -789,9 +819,9 @@ def main():
 
             metrics_val  = evaluate_all(model, preproc, splits_info["X_val"],  splits_info["y_val"])
             metrics_test = evaluate_all(model, preproc, splits_info["X_test"], splits_info["y_test"])
-            model_dir = MODELS_DIR / args.name
+            model_dir2 = MODELS_DIR / args.name
             config_dict = {"algo": algo, algo: asdict(cfg_obj)}
-            save_all(args.name, model, preproc, config_dict, numeric_cols, metrics_val, metrics_test, splits_info, data_hash, model_dir)
+            save_all(args.name, model, preproc, config_dict, numeric_cols, metrics_val, metrics_test, splits_info, data_hash, model_dir2, cv_summary)
             print(f"[OK] Modelo '{args.name}' entrenado y guardado.")
             return 0
 
@@ -817,10 +847,8 @@ def main():
             return 0
 
         else:  # named
-            model_dir = MODELS_DIR / model_name
-            ensure_dir(model_dir)
             cfg_loaded = {}
-            if has_config(model_name):
+            if (model_dir / "config.json").exists():
                 with open(model_dir / "config.json", "r", encoding="utf-8") as f:
                     cfg_loaded = json.load(f)
             algo = (cfg_loaded.get("algo") or "rf").lower()
@@ -837,7 +865,7 @@ def main():
 
             preproc = build_preprocessor(numeric_cols)
 
-            if exists_checkpoint(model_name) and not args.retrain:
+            if (model_dir / "checkpoints" / "model.pkl").exists() and not args.retrain:
                 print(f"[INFO] Cargando checkpoint existente ({model_name}). Usa --retrain para forzar nuevo entrenamiento.")
                 model, preproc, _ = load_checkpoint(model_name)
             else:
@@ -853,7 +881,7 @@ def main():
                 metrics_val  = evaluate_all(model, preproc, splits_info["X_val"],  splits_info["y_val"])
                 metrics_test = evaluate_all(model, preproc, splits_info["X_test"], splits_info["y_test"])
                 config_dict = {"algo": algo, algo: asdict(cfg_obj)}
-                save_all(model_name, model, preproc, config_dict, numeric_cols, metrics_val, metrics_test, splits_info, data_hash, model_dir)
+                save_all(model_name, model, preproc, config_dict, numeric_cols, metrics_val, metrics_test, splits_info, data_hash, model_dir, cv_summary)
                 print(f"[OK] Modelo '{model_name}' entrenado y guardado.")
                 return 0
 
@@ -866,5 +894,88 @@ def main():
     finally:
         prevent_sleep_stop()
 
+# ==============
+# Búsqueda simple (se mantiene como estaba si ya existía)
+# ==============
+def hyperparam_search(X_train, y_train, X_val, y_val, algo: str, seed: int):
+    rng = np.random.RandomState(seed)
+    board = []
+    if algo == "rf":
+        space = {
+            "n_estimators": [400, 600, 800, 1200, 1600],
+            "max_depth": [None, 10, 20, 30],
+            "min_samples_leaf": [1, 2, 3],
+        }
+        samples = list(ParameterSampler(space, n_iter=10, random_state=rng))
+        for cfg in samples:
+            pre = build_preprocessor(list(X_train.columns))
+            model = RandomForestClassifier(
+                n_estimators=cfg["n_estimators"],
+                max_depth=cfg["max_depth"],
+                min_samples_leaf=cfg["min_samples_leaf"],
+                class_weight="balanced",
+                random_state=SEED,
+                n_jobs=-1,
+            )
+            X_tr = pre.fit_transform(X_train); X_v = pre.transform(X_val)
+            model.fit(X_tr, y_train)
+            prob_v = model.predict_proba(X_v)[:,1]
+            auc = roc_auc_score(y_val, prob_v); f1v = f1_score(y_val, (prob_v>=0.5).astype(int))
+            board.append((auc, f1v, cfg, {"auc": auc, "f1": f1v}))
+        board.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best = board[0]
+        return best, board
+    else:
+        if not _HAVE_XGB:
+            raise RuntimeError("xgboost no instalado")
+        space = {
+            "n_estimators": [400, 800, 1200],
+            "max_depth": [4, 6, 8],
+            "learning_rate": [0.05, 0.1, 0.2],
+            "subsample": [0.8, 1.0],
+            "colsample_bytree": [0.8, 1.0],
+            "reg_lambda": [0.5, 1.0, 2.0],
+        }
+        samples = list(ParameterSampler(space, n_iter=10, random_state=rng))
+        for cfg in samples:
+            pre = build_preprocessor(list(X_train.columns))
+            model = xgb.XGBClassifier(
+                n_estimators=cfg["n_estimators"],
+                max_depth=cfg["max_depth"],
+                learning_rate=cfg["learning_rate"],
+                subsample=cfg["subsample"],
+                colsample_bytree=cfg["colsample_bytree"],
+                reg_lambda=cfg["reg_lambda"],
+                random_state=SEED,
+                n_jobs=-1,
+                tree_method="hist",
+                eval_metric="auc",
+                verbosity=0,
+            )
+            X_tr = pre.fit_transform(X_train); X_v = pre.transform(X_val)
+            model.fit(X_tr, y_train)
+            prob_v = model.predict_proba(X_v)[:,1]
+            auc = roc_auc_score(y_val, prob_v); f1v = f1_score(y_val, (prob_v>=0.5).astype(int))
+            board.append((auc, f1v, cfg, {"auc": auc, "f1": f1v}))
+        board.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best = board[0]
+        return best, board
+
+# ==============
+# Carga checkpoint
+# ==============
+def load_checkpoint(model_name: str):
+    model_dir = MODELS_DIR / model_name / "checkpoints"
+    model = joblib.load(model_dir / "model.pkl")
+    preproc = joblib.load(model_dir / "preproc.pkl")
+    # recuperar config si existe para mostrar
+    cfg_path = (MODELS_DIR / model_name / "config.json")
+    loaded_cfg = {}
+    if cfg_path.exists():
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            loaded_cfg = json.load(f)
+    return model, preproc, loaded_cfg
+
 if __name__ == "__main__":
     sys.exit(main())
+
