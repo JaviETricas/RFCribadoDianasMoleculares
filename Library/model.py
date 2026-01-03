@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-model.py — Entrenamiento de modelos para TFM (clasificación de alta actividad) con:
-- Etiquetado por fracción IC50 y **reporte del corte en nM** (especialmente para 50/50).
-- **K-Fold Cross-Validation** estratificado (por defecto K=5, activado para 500–5000 filas).
-- Prevención de suspensión en Windows, guardado reproducible, progreso y early stopping.
-- Curvas **ROC/PR** y matriz de confusión para val/test; ROC por fold en CV.
-"""
 
-import os, sys, json, math, ctypes, hashlib, datetime, warnings, copy
+import os, sys, json, math, ctypes, hashlib, datetime, warnings, copy, inspect
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, Tuple, Optional, List
@@ -48,9 +41,7 @@ try:
 except Exception:
     _HAVE_SHAP = False
 
-# ======================
 # Constantes y rutas
-# ======================
 SEED = 1234
 DEFAULT_IC50_FRAC = 0.5
 DEFAULT_TRAIN = 0.75
@@ -69,14 +60,12 @@ MODELS_DIR = REPO_ROOT / "Models"
 META_FORBIDDEN = {
     "Standard Value","Molecule ChEMBL ID","Smiles","canonical_smiles",
     "Standard Type","Standard Relation","Standard Units","Target ChEMBL ID","activo",
-    # columnas nuevas de filtros:
     "PAINS_flag","PAINS_terms","Chelator_flag","Chelator_terms",
     "Lipinski_violations","Veber_violations",
 }
 
-# ======================
+
 # Utilidades
-# ======================
 def prevent_sleep_start():
     """Evita que Windows entre en suspensión durante procesos largos."""
     if os.name == "nt":
@@ -127,18 +116,9 @@ def pick_id_column(df: pd.DataFrame) -> str:
             return c
     return "__index__"
 
-# ======================
 # Etiquetado por fracción (devuelve y, corte_nM)
-# ======================
 def build_label_by_fraction(values: pd.Series, fraction: float, seed: int = SEED) -> Tuple[pd.Series, float]:
-    """
-    Marca como 1 el fraction% de filas con menor IC50 (Standard Value).
-    Si hay empates en el valor de corte, selecciona aleatoriamente (con semilla) dentro de los empatados
-    hasta cumplir exactamente el porcentaje deseado.
 
-    Devuelve:
-      y (Series 0/1) y el **corte en nM** (el IC50 máximo dentro del grupo etiquetado como 1).
-    """
     vals = pd.to_numeric(values, errors="coerce")
     valid = vals.notna()
     idx = np.arange(len(vals))
@@ -184,9 +164,7 @@ def build_label_by_fraction(values: pd.Series, fraction: float, seed: int = SEED
     corte_nm = float(np.nanmax(vals.loc[y.astype(bool)])) if y.any() else float(cut_val_nominal)
     return y, corte_nm
 
-# ======================
 # Splits estratificados
-# ======================
 def stratified_train_val_test(X: pd.DataFrame, y: pd.Series, train_ratio: float, val_ratio: float, seed: int = SEED):
     assert 0 < train_ratio < 1, "train debe ser (0,1)"
     assert 0 <= val_ratio < 1, "val debe ser [0,1)"
@@ -207,9 +185,7 @@ def stratified_train_val_test(X: pd.DataFrame, y: pd.Series, train_ratio: float,
     X_test, y_test = X_rest.iloc[test_idx_rel], y_rest.iloc[test_idx_rel]
     return X_train, y_train, X_val, y_val, X_test, y_test
 
-# ======================
 # Modelos y preprocesado
-# ======================
 def build_preprocessor(numeric_cols: List[str]) -> ColumnTransformer:
     num_pipe = Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))])
     preproc = ColumnTransformer(
@@ -328,18 +304,79 @@ def fit_rf_with_early_stopping(preproc: ColumnTransformer, cfg: RFConfig,
 
 def fit_xgb_with_logging(preproc: ColumnTransformer, cfg: XGBConfig,
                          X_train, y_train, X_val, y_val):
+    """Entrena XGB con early stopping de forma compatible con varias versiones de xgboost.
+
+    - xgboost <= 1.x: early_stopping_rounds suele ir como kwarg en .fit(...)
+    - xgboost >= 2.x/3.x: early stopping suele configurarse vía callbacks o parámetros del estimador.
+    """
     X_tr = preproc.fit_transform(X_train)
     X_v  = preproc.transform(X_val)
     model = build_model(cfg)
+
     print(f"[INFO] Comienza entrenamiento XGB con early_stopping_rounds={cfg.early_stopping_rounds}")
-    model.fit(
-        X_tr, y_train,
+
+    # Argumentos comunes
+    fit_common = dict(
         eval_set=[(X_v, y_val)],
         verbose=cfg.verbose,
-        early_stopping_rounds=cfg.early_stopping_rounds
     )
-    print(f"[INFO] Mejor iteración XGB: {model.best_iteration} | Mejor puntuación val (eval_metric): {model.best_score}")
+
+    # 1) API antigua: early_stopping_rounds en fit()
+    fit_params = inspect.signature(model.fit).parameters
+    if "early_stopping_rounds" in fit_params:
+        model.fit(
+            X_tr, y_train,
+            **fit_common,
+            early_stopping_rounds=int(cfg.early_stopping_rounds),
+        )
+    else:
+        # 2) API nueva: configurar early stopping vía callbacks (en fit o en el estimador)
+        cb = None
+        try:
+            cb = [xgb.callback.EarlyStopping(
+                rounds=int(cfg.early_stopping_rounds),
+                maximize=True,
+                save_best=True,
+            )]
+        except Exception:
+            cb = None
+
+        # 2a) Si fit() acepta callbacks explícitos
+        if cb is not None and "callbacks" in fit_params:
+            model.fit(
+                X_tr, y_train,
+                **fit_common,
+                callbacks=cb,
+            )
+        else:
+            # 2b) Si callbacks se pasan como parámetro del estimador (xgboost moderno)
+            try:
+                if cb is not None and hasattr(model, "set_params") and "callbacks" in model.get_params():
+                    model.set_params(callbacks=cb)
+            except Exception:
+                pass
+
+            # 2c) Algunos builds también aceptan early_stopping_rounds como parámetro del estimador
+            try:
+                if hasattr(model, "set_params") and "early_stopping_rounds" in model.get_params():
+                    model.set_params(early_stopping_rounds=int(cfg.early_stopping_rounds))
+            except Exception:
+                pass
+
+            model.fit(
+                X_tr, y_train,
+                **fit_common,
+            )
+
+    best_it = getattr(model, "best_iteration", None)
+    best_sc = getattr(model, "best_score", None)
+    if best_it is not None:
+        print(f"[INFO] Mejor iteración XGB: {best_it} | Mejor puntuación val (eval_metric): {best_sc}")
+    else:
+        print("[INFO] Entrenamiento XGB finalizado (best_iteration no disponible en esta versión).")
+
     return model, preproc
+
 
 def predict_proba(model, preproc, X):
     Xp = preproc.transform(X)
@@ -424,9 +461,7 @@ def try_save_shap(model, preproc, X_sample: pd.DataFrame, out_dir: Path, prefix:
     except Exception:
         return False
 
-# ======================
 # Guardado / carga
-# ======================
 def save_all(model_name: str, model, preproc, config: Dict[str, Any], feature_names: List[str],
              metrics_val: Dict[str, Any], metrics_test: Dict[str, Any],
              splits_info: Dict[str, Any], data_hash: str, model_dir: Path, cv_summary: Optional[Dict[str, Any]] = None):
@@ -488,9 +523,7 @@ def save_all(model_name: str, model, preproc, config: Dict[str, Any], feature_na
     })
     df_splits.to_csv(splits_csv, index=False)
 
-# ======================
 # Cross-Validation
-# ======================
 def run_cv_evaluation(X: pd.DataFrame, y: pd.Series, numeric_cols: List[str],
                       algo: str, cfg_any, k: int, plots_dir: Path) -> Dict[str, Any]:
     """Ejecuta Stratified K-Fold CV (ROC/F1) usando un modelo más ligero para rapidez."""
@@ -572,9 +605,7 @@ def run_cv_evaluation(X: pd.DataFrame, y: pd.Series, numeric_cols: List[str],
     print(f"[CV] Resumen: AUC {summary['cv_auc_mean']:.4f} ± {summary['cv_auc_std']:.4f} | F1 {summary['cv_f1_mean']:.4f} ± {summary['cv_f1_std']:.4f} | gap AUC (train-val) medio {summary['cv_gap_auc_mean']:+.4f}")
     return summary
 
-# ======================
 # CLI
-# ======================
 def parse_args():
     import argparse
     p = argparse.ArgumentParser(description="Entrenador de modelos TFM (clasificación alta actividad).")
@@ -639,9 +670,7 @@ def make_cfg_obj_from_args(args, algo: str):
             verbose=bool(args.xgb_verbose),
         )
 
-# ======================
 # Programa principal
-# ======================
 def main():
     set_global_seed(SEED)
     args = parse_args()
@@ -739,7 +768,6 @@ def main():
     cv_summary = None
     if do_cv:
         print(f"[INFO] Ejecutando Stratified K-Fold CV (k={args.cv_k}) para estimar generalización y posibles overfittings...")
-        # Determinar algoritmo y cfg para CV
         if mode == "base":
             algo = "rf"
             cfg_cv = make_cfg_obj_from_args(args, "rf")
@@ -747,9 +775,9 @@ def main():
             algo = args.algo.lower()
             cfg_cv = make_cfg_obj_from_args(args, algo)
         elif mode == "test":
-            algo = "rf"  # por simplicidad, CV con RF
+            algo = "rf"  
             cfg_cv = make_cfg_obj_from_args(args, "rf")
-        else:  # named
+        else:  
             cfg_loaded = {}
             if (model_dir / "config.json").exists():
                 with open(model_dir / "config.json", "r", encoding="utf-8") as f:
@@ -793,7 +821,6 @@ def main():
                 print("[OK] Modelo base entrenado y guardado.")
                 return 0
 
-            # Incluso si cargamos, mostramos métricas actuales
             metrics_val  = evaluate_all(model, preproc, splits_info["X_val"],  splits_info["y_val"])
             metrics_test = evaluate_all(model, preproc, splits_info["X_test"], splits_info["y_test"])
             print(f"[INFO] Métricas (val): AUC={metrics_val['roc_auc']:.3f}, PR AUC={metrics_val['pr_auc']:.3f}, F1={metrics_val['f1']:.3f}")
@@ -894,9 +921,8 @@ def main():
     finally:
         prevent_sleep_stop()
 
-# ==============
-# Búsqueda simple (se mantiene como estaba si ya existía)
-# ==============
+
+# Búsqueda simple
 def hyperparam_search(X_train, y_train, X_val, y_val, algo: str, seed: int):
     rng = np.random.RandomState(seed)
     board = []
@@ -961,9 +987,8 @@ def hyperparam_search(X_train, y_train, X_val, y_val, algo: str, seed: int):
         best = board[0]
         return best, board
 
-# ==============
+
 # Carga checkpoint
-# ==============
 def load_checkpoint(model_name: str):
     model_dir = MODELS_DIR / model_name / "checkpoints"
     model = joblib.load(model_dir / "model.pkl")
