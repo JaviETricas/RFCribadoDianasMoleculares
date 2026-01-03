@@ -1,26 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-setup.py — Orquestador del pipeline TFM
-Ubicación: raíz del repositorio (mismo nivel que la carpeta 'Library/').
-
-Flujo básico:
-1) Verifica que RDKit esté instalado. Si no, muestra instrucciones y sale.
-2) Ejecuta descriptor.py (añade --predict si se pasa en este setup).
-3) Ejecuta filtros.py con las flags seleccionadas (--all | --pains | --chelators | --druglikeness).
-   También añade --predict si se pasó al setup.
-4) Si NO se pasa --notrain → ejecuta model.py y reenvía los argumentos propios de model.py.
-   Si SÍ se pasa --notrain → ejecuta predictor.py (y reenvía flags compatibles de predictor).
-Al finalizar cada fase, imprime un mensaje resumen.
-"""
 
 import sys
 import subprocess
 from pathlib import Path
 
-# ======================
 # Rutas relativas
-# ======================
 THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parent
 LIB_DIR   = REPO_ROOT / "Library"
@@ -30,9 +15,7 @@ FILT_PY = LIB_DIR / "filtros.py"
 MODEL_PY = LIB_DIR / "model.py"
 PRED_PY = LIB_DIR / "predictor.py"
 
-# ======================
 # Utilidades
-# ======================
 def rdkit_ok() -> bool:
     try:
         from rdkit import Chem  # noqa: F401
@@ -62,7 +45,7 @@ def parse_known():
     p.add_argument("--pains", action="store_true", help="Aplicar filtro PAINS.")
     p.add_argument("--chelators", action="store_true", help="Aplicar filtro de quelación pan-metalo.")
     p.add_argument("--druglikeness", action="store_true", help="Añadir nº de violaciones Lipinski/Veber.")
-    # Todo lo demás lo dejamos como 'desconocido' para reenviar a model/predictor
+
     args, unknown = p.parse_known_args()
     return args, unknown
 
@@ -76,7 +59,7 @@ MODEL_FLAGS_VALUE = {
 MODEL_FLAGS_BOOL = {"--retrain","--xgb_verbose"}
 
 PRED_FLAGS_VALUE = {"--dir","--model","--threshold"}
-PRED_FLAGS_BOOL  = set()  # de momento ninguno
+PRED_FLAGS_BOOL  = set()
 
 def split_unknowns(unknown: list[str], allowed_value: set[str], allowed_bool: set[str]) -> list[str]:
     """Extrae de unknown solo las flags soportadas, conservando valores cuando proceda."""
@@ -95,14 +78,12 @@ def split_unknowns(unknown: list[str], allowed_value: set[str], allowed_bool: se
                     out.append(nxt)
                     i += 2
                 else:
-                    # flag con valor pero sin valor explícito → lo ignoramos con aviso
                     print(f"[AVISO] La flag {tok} esperaba un valor; se ignora por no estar presente.")
                     i += 1
             else:
                 print(f"[AVISO] La flag {tok} esperaba un valor; se ignora por no estar presente.")
                 i += 1
         else:
-            # Flag no reconocida para este destino → ignorar en silencio
             i += 1
     return out
 
@@ -132,7 +113,6 @@ def main():
     filt_cmd = [sys.executable, str(FILT_PY)]
     if args.predict:
         filt_cmd.append("--predict")
-    # Añadir flags de filtros si se pidieron (si no, filtros.py saldrá con aviso y returncode=0)
     if args.all:          filt_cmd.append("--all")
     if args.pains:        filt_cmd.append("--pains")
     if args.chelators:    filt_cmd.append("--chelators")
