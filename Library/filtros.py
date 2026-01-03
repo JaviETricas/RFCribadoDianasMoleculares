@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-filters.py — Añade columnas de filtros a Dataset/Procesados/descriptores.csv:
-  - PAINS (RDKit FilterCatalog)
-  - Quelación pan-metalo (SMARTS: catecol, 1,2-dioles, hidroxamato, ditiocarbamato, tiol, 8-hidroxiquinolina)
-  - Drug-likeness "suave": nº de violaciones Lipinski y Veber
-
-Se activan con flags: --pains, --chelators, --druglikeness, o --all (aplica todos).
-Sobrescribe el CSV de entrada añadiendo las columnas nuevas.
-
-Requisitos: RDKit instalado.
-"""
 
 import sys, json
 from pathlib import Path
@@ -39,7 +28,7 @@ except Exception as e:
 # ==== ARGUMENTOS ====
 import argparse
 p = argparse.ArgumentParser(description="Aplicar filtros a descriptores.csv")
-p.add_argument("--dir", type=str, default=str(DEFAULT_CSV),
+p.add_argument("--dir", type=str, default=None,
                help="CSV de descriptores a filtrar (por defecto Dataset/Procesados/descriptores.csv)")
 p.add_argument("--predict", action="store_true", help="Usar Dataset/Prediccion/descriptores.csv como entrada/salida por defecto.")
 p.add_argument("--all", action="store_true", help="Aplicar todos los filtros")
@@ -128,7 +117,7 @@ def apply_pains(mols):
     return pains_flag, pains_terms
 
 # ==== 2) QUELACIÓN PAN-METALO (SMARTS) ====
-# Nota: patrones aproximados y conservadores; puedes ajustarlos si lo deseas.
+# Nota: patrones aproximados y conservadores; pueden ajustarse
 CHELATOR_SMARTS = {
     "catechol_o_dihydroxybenzene": "c1c(O)cccc1O",           # aproximado (orto-diOH aromático)
     "vicinal_diol":                "[CX4](O)[CX4](O)",        # 1,2-diol alifático genérico
@@ -136,7 +125,7 @@ CHELATOR_SMARTS = {
     "dithiocarbamate":             "[NX3][CX3](=S)[SX2]",     # -N-C(=S)-S-
     "thiol":                       "[SX2H]",                  # -SH
     "8_hydroxyquinoline":          "Oc1cccc2ncccc12",         # 8-hidroxiquinolina
-    # Puedes añadir más: hydroxypyridinone, 2,3-dihidroxipiridina, etc.
+    # Se puedes añadir más: hydroxypyridinone, 2,3-dihidroxipiridina, etc.
 }
 CHELATOR_PATTERNS = {name: Chem.MolFromSmarts(sma) for name, sma in CHELATOR_SMARTS.items()}
 
